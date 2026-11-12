@@ -58,3 +58,67 @@ async def create_link(payload:LinkCreate,db:AsyncSession = Depends(get_db)):
         clicks = 0,
         created_at = link.created_at,
     )
+
+
+@router.get("/links",response_model=list[LinkOut])
+async def list_links(db:AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Link)
+        .order_by(
+            Link.created_at.desc()
+        )
+    )
+
+    links = result.scalars().all()
+
+    pipe = redis.pipeline()
+    for link in links:
+        pipe.get(f"clicks:{link.slug}")
+    counts = await pipe.execute()
+
+    response = []
+
+    for i , link in enumerate(links):
+
+        item = LinkOut(
+            slug = link.slug,
+            url = link.url,
+            short_url=f"{settings.base_url}/{link.slug}",
+            clicks=int(counts[i] or 0),
+            created_at = link.created_at,
+        )
+
+        response.append(item)
+
+    return response
+
+
+
+@router.get("/links/{slug}/stats",response_model=LinkStats)
+async def get_stats(slug:str,db:AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Link).where(Link.slug==slug))
+    link = result.scalar_one_or_none()
+    if not link:
+        raise HTTPException(404,"Link not found")
+
+    clicks = await redis.get(f"clicks:{slug}")
+    return LinkStats(slug=slug,url=link.url,clicks=int(clicks or 0))
+
+
+@router.get("/{slug}")
+async def redirect(slug:str,db:AsyncSession = Depends(get_db)):
+
+    cached = await redis.get(f"link:{slug}")
+    if cached:
+        await redis.incr(f"clicks:{slug}")
+        return RedirectResponse(cached,status_code=302)
+
+    result = await db.execute(select(Link).where(Link.slug == slug))
+    link = result.scalar_one_or_none()
+    if not link:
+        raise HTTPException(404,"Link not found")
+
+    await redis.set(f"link:{slug}",link.url,ex=settings.link_ttl_seconds)
+
+    await redis.incr(f"clicks:{slug}")
+    return RedirectResponse(link.url,status_code=302)
